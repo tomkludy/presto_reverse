@@ -1,0 +1,13 @@
+[package]
+name = "presto_reverse"
+version = "0.1.0"
+authors = ["Tom Kludy <tom.kludy@citrix.com>"]
+
+[dependencies]
+log = "0.3"
+futures = "0.1"
+tokio-core = "0.1"
+tokio-io = "0.1"
+env_logger = "0.3"
+trust-dns = { version = "0.9.2", default-features = false }
+trust-dns-resolver = "^0.7"
