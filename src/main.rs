@@ -50,7 +50,7 @@ extern crate trust_dns_resolver;
 use std::cell::RefCell;
 use std::env;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, IpAddr};
+use std::net::{Shutdown};
 use std::net::{SocketAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::rc::Rc;
 use std::str;
@@ -61,8 +61,7 @@ use futures::{Future, Stream, Poll, Async};
 use tokio_io::io::{read_exact, write_all, Window};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_core::reactor::{Core, Handle, Timeout};
-use trust_dns::op::{Message, ResponseCode};
-use trust_dns::rr::{Name, RData};
+use trust_dns::rr::{Name};
 use trust_dns_resolver::ResolverFuture;
 use trust_dns_resolver::config::*;
 
@@ -87,7 +86,7 @@ fn main() {
     // let resolver = ResolverFuture::new(
     //     ResolverConfig::default(),
     //     ResolverOpts::default(),
-    //     &lp.handle());
+    //     &handle.clone());
 
     // Construct a future representing our server. This future processes all
     // incoming connections and spawns a new task for each client which will do
@@ -102,10 +101,11 @@ fn main() {
     let clients = listener.incoming().map(move |(socket, addr)| {
         (Client {
             buffer: buffer.clone(),
+            // dns: resolver.clone(),
             dns: ResolverFuture::new(
                     ResolverConfig::default(),
                     ResolverOpts::default(),
-                    &lp.handle()),
+                    &handle.clone()),
             handle: handle.clone(),
         }.serve(socket), addr)
     });
@@ -308,14 +308,9 @@ impl Client {
                 // the hostname.
                 //
                 // Finally, to perform the "interesting" part, we process the
-                // buffer and pass the retrieved hostname to a query future if
-                // it wasn't already recognized as an IP address. The query is
-                // very basic: it asks for an IPv4 address with a timeout of
-                // five seconds. We're using TRust-DNS at the protocol level,
-                // so we don't have the functionality normally expected from a
-                // stub resolver, such as sorting of answers according to RFC
-                // 6724, more robust timeout handling, or resolving CNAME
-                // lookups.
+                // buffer and pass the retrieved hostname to a resolver future
+                // if it wasn't already recognized as an IP address. TRust-DNS
+                // handles all of the complexity from there out.
                 v5::ATYP_DOMAIN => {
                     mybox(read_exact(c, [0u8]).and_then(|(conn, buf)| {
                         read_exact(conn, vec![0u8; buf[0] as usize + 2])
@@ -328,9 +323,22 @@ impl Client {
                             Err(e) => return mybox(future::err(e)),
                         };
 
-                        let lookupIpFuture = dns.lookup_ip(&name.to_string());
-                        let first = address.and_then(|addr| addr.iter().next().expect(&format!("no IP for address: {}", name)));
-                        mybox(first.map(|addr| (conn, addr)))
+                        debug!("dns lookup {}", name);
+
+                        let lookup_future = dns.lookup_ip(&name.to_string());
+                        let address_future =
+                            lookup_future
+                                .map_err(|e|
+                                    other(&format!("dns error: {}", e)))
+                                .and_then(move |ips| {
+                                    let ip = ips.iter().next()
+                                        .expect(
+                                            &format!("lookup failed for: {}",
+                                            &name));
+                                    mybox(future::ok(ip))
+                                });
+                        mybox(address_future.map(move |addr|
+                            (conn, SocketAddr::new(addr, port))))
                     }))
                 }
 
@@ -646,25 +654,6 @@ fn name_port(addr_buf: &[u8]) -> io::Result<UrlHost> {
         io::Error::new(io::ErrorKind::Other, e.to_string())
     }));
     Ok(UrlHost::Name(name, port))
-}
-
-// Extracts the first IP address from the response.
-fn get_addr(response: Message, port: u16) -> io::Result<SocketAddr> {
-    if response.get_response_code() != ResponseCode::NoError {
-        return Err(other("resolution failed"));
-    }
-    let addr = response.get_answers().iter().filter_map(|ans| {
-        match *ans.get_rdata() {
-            RData::A(addr) => Some(IpAddr::V4(addr)),
-            RData::AAAA(addr) => Some(IpAddr::V6(addr)),
-            _ => None,
-        }
-    }).next();
-
-    match addr {
-        Some(addr) => Ok(SocketAddr::new(addr, port)),
-        None => Err(other("no address records in response")),
-    }
 }
 
 // Various constants associated with the SOCKS protocol
