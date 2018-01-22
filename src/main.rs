@@ -83,6 +83,9 @@ fn main() {
 
     // Use TRust-DNS's resolver with all defaults (including, using the system
     // DNS server) rather than trying to do DNS lookup ourselves
+
+    // Unfortunately the ResolverFuture is not cloneable.. so we have to create one
+    // for each client.  This is probably terribly inefficient.
     // let resolver = ResolverFuture::new(
     //     ResolverConfig::default(),
     //     ResolverOpts::default(),
@@ -101,11 +104,8 @@ fn main() {
     let clients = listener.incoming().map(move |(socket, addr)| {
         (Client {
             buffer: buffer.clone(),
+            // if only this were cloneable...
             // dns: resolver.clone(),
-            dns: ResolverFuture::new(
-                    ResolverConfig::default(),
-                    ResolverOpts::default(),
-                    &handle.clone()),
             handle: handle.clone(),
         }.serve(socket), addr)
     });
@@ -135,7 +135,7 @@ fn main() {
 // lifetime.
 struct Client {
     buffer: Rc<RefCell<Vec<u8>>>,
-    dns: ResolverFuture,
+    // dns: ResolverFuture,
     handle: Handle,
 }
 
@@ -256,9 +256,9 @@ impl Client {
         //
         // Depending on the address type, we then delegate to different futures
         // to implement that particular address format.
-        let dns = self.dns;
         let resv = command.and_then(|c| read_exact(c, [0u8]).map(|c| c.0));
         let atyp = resv.and_then(|c| read_exact(c, [0u8]));
+        let handle = self.handle.clone();
         let addr = mybox(atyp.and_then(move |(c, buf)| {
             match buf[0] {
                 // For IPv4 addresses, we read the 4 bytes for the address as
@@ -324,6 +324,11 @@ impl Client {
                         };
 
                         debug!("dns lookup {}", name);
+
+                        let dns = ResolverFuture::new(
+                                ResolverConfig::default(),
+                                ResolverOpts::default(),
+                                &handle);
 
                         let lookup_future = dns.lookup_ip(&name.to_string());
                         let address_future =
@@ -524,6 +529,11 @@ struct Transfer {
     // The shared global buffer that all connections on our server are using.
     buf: Rc<RefCell<Vec<u8>>>,
 
+    // If the reads are outpacing the writes, then an ephemeral buffer will
+    // be stored within the Transfer object, keeping the bytes that were
+    // last unable to be written.
+    overrun: RefCell<Option<Vec<u8>>>,
+
     // The number of bytes we've written so far.
     amt: u64,
 }
@@ -536,6 +546,7 @@ impl Transfer {
             reader: reader,
             writer: writer,
             buf: buffer,
+            overrun: RefCell::new(None),
             amt: 0,
         }
     }
@@ -572,53 +583,59 @@ impl Future for Transfer {
         // the write half are ready on the connection, allowing the buffer to
         // only be temporarily used in a small window for all connections.
         loop {
-            let read_ready = self.reader.poll_read().is_ready();
             let write_ready = self.writer.poll_write().is_ready();
-            if !read_ready || !write_ready {
+            if !write_ready {
                 return Ok(Async::NotReady)
             }
 
-            // TODO: This exact logic for reading/writing amounts may need an
-            //       update
-            //
-            // Right now the `buffer` is actually pretty big, 64k, and it could
-            // be the case that one end of the connection can far outpace
-            // another. For example we may be able to always read 64k from the
-            // read half but only be able to write 5k to the client. This is a
-            // pretty bad situation because we've got data in a buffer that's
-            // intended to be ephemeral!
-            //
-            // Ideally here we'd actually adapt the rate of reads to match the
-            // rate of writes. That is, we'd prefer to have some form of
-            // adaptive algorithm which keeps track of how many bytes are
-            // written and match the read rate to the write rate. It's possible
-            // for connections to have an even smaller (and optional) buffer on
-            // the side representing the "too much data they read" if that
-            // happens, and then the next call to `read` could compensate by not
-            // reading so much again.
-            //
-            // In any case, though, this is easily implementable in terms of
-            // adding fields to `Transfer` and is complicated enough to
-            // otherwise detract from the example in question here. As a result,
-            // we simply read into the global buffer and then assert that we
-            // write out exactly the same amount.
-            //
-            // This means that we may trip the assert below, but it should be
-            // relatively easily fixable with the strategy above!
+            let mut new_overrun = self.overrun.borrow_mut();
+            if new_overrun.is_some() {
 
-            let n = try_nb!((&*self.reader).read(&mut buffer));
-            if n == 0 {
-                try!(self.writer.shutdown(Shutdown::Write));
-                return Ok(self.amt.into())
+                // We have leftovers from the last time we read.
+                // Flush those leftovers before doing anything else.
+                *new_overrun = {
+                    let buf = new_overrun.as_ref().unwrap();
+                    let m = try!((&*self.writer).write(&buf));
+                    if m < buf.len() {
+                        // Still more leftovers...
+                        let remain = buf[m as usize..].to_vec();
+                        debug!("We have leftovers: {}", remain.len());
+                        Some(remain)
+                    } else {
+                        // Finally cleaned our plate
+                        debug!("Leftovers done");
+                        None
+                    }
+                };
+
+            } else {
+
+                // We need to read more before continuing.
+                let read_ready = self.reader.poll_read().is_ready();
+                if !read_ready {
+                    return Ok(Async::NotReady)
+                }
+
+                let n = try_nb!((&*self.reader).read(&mut buffer));
+                if n == 0 {
+                    // Source of the read has hit EOF.  Shut down both ends.
+                    try!(self.writer.shutdown(Shutdown::Write));
+                    return Ok(self.amt.into())
+                }
+                self.amt += n as u64;
+
+                // Try writing with non-blocking IO
+                let m = try_nb!((&*self.writer).write(&buffer[..n]));
+                if m < n {
+                    // We have leftovers, write them next time
+                    let remain = buffer[m as usize..].to_vec();
+                    debug!("We have leftovers: {}", remain.len());
+                    *new_overrun = Some(remain);
+                } else {
+                    // Write completed
+                    *new_overrun = None
+                }
             }
-            self.amt += n as u64;
-
-            // Unlike above, we don't handle `WouldBlock` specially, because
-            // that would play into the logic mentioned above (tracking read
-            // rates and write rates), so we just ferry along that error for
-            // now.
-            let m = try!((&*self.writer).write(&buffer[..n]));
-            assert_eq!(n, m);
         }
     }
 }
