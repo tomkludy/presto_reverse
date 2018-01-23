@@ -114,9 +114,9 @@ fn main() {
         handle.spawn(client.then(move |res| {
             match res {
                 Ok((a, b)) => {
-                    println!("proxied {}/{} bytes for {}", a, b, addr)
+                    debug!("proxied {}/{} bytes for {}", a, b, addr)
                 }
-                Err(e) => println!("error for {}: {}", addr, e),
+                Err(e) => info!("error for {}: {}", addr, e),
             }
             future::ok(())
         }));
@@ -323,7 +323,7 @@ impl Client {
                             Err(e) => return mybox(future::err(e)),
                         };
 
-                        debug!("dns lookup {}", name);
+                        info!("dns lookup {}", name);
 
                         let dns = ResolverFuture::new(
                                 ResolverConfig::default(),
@@ -599,11 +599,11 @@ impl Future for Transfer {
                     if m < buf.len() {
                         // Still more leftovers...
                         let remain = buf[m as usize..].to_vec();
-                        debug!("We have leftovers: {}", remain.len());
+                        info!("We have leftovers: {}", remain.len());
                         Some(remain)
                     } else {
                         // Finally cleaned our plate
-                        debug!("Leftovers done");
+                        info!("Leftovers done");
                         None
                     }
                 };
@@ -629,7 +629,7 @@ impl Future for Transfer {
                 if m < n {
                     // We have leftovers, write them next time
                     let remain = buffer[m as usize..].to_vec();
-                    debug!("We have leftovers: {}", remain.len());
+                    info!("We have leftovers: {}", remain.len());
                     *new_overrun = Some(remain);
                 } else {
                     // Write completed
